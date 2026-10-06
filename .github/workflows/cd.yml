@@ -1,0 +1,65 @@
+# ──────────────────────────────────────────────────────────────────────────
+# CD — wdrożenie schematu bazy (Flyway) na DEV, następnie PROD.
+# Uruchamiane ręcznie (workflow_dispatch). Działa na self-hosted runnerze
+# (Optiplex) — wallet brany z lokalnego dysku, hasła z GitHub Secrets,
+# ścieżki/URL z GitHub Variables. PROD za bramką Approve (environment: prod).
+# Kolejność: migrate-dev -> [akceptacja] -> migrate-prod.
+# ──────────────────────────────────────────────────────────────────────────
+
+name: CD
+
+on:
+  workflow_dispatch:        # klikasz ręcznie: Actions -> CD -> Run workflow
+
+jobs:
+  migrate-dev:
+    runs-on: [self-hosted, optiplex]
+    env:
+      FLYWAY_URL: "${{ vars.PKP_FLYWAY_URL_DEV }}"
+      FLYWAY_USER: ${{ vars.PKP_FLYWAY_USER_DEV }} 
+      FLYWAY_PASSWORD: ${{ secrets.PKP_ADMIN_PASSWORD_DEV }}
+      WALLET_DIR: ${{ vars.PKP_WALLET_DIR_LOCAL_DEV }} 
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Flyway migrate (5 projektow) na PKPDEV
+        shell: powershell -ExecutionPolicy Bypass -Command "& '{0}'"
+        run: |
+          foreach ($p in "admin","stg","maintenance","silver","gold") {
+            Write-Host "=== migrate: $p ==="
+            docker run --rm `
+              -v "${{ github.workspace }}:/repo" `
+              -v "${env:WALLET_DIR}:/wallet:ro" `
+              redgate/flyway:11 `
+              "-configFiles=/repo/migrations/$p/conf/flyway.conf" `
+              "-locations=filesystem:/repo/migrations/$p/sql" `
+              -url="$env:FLYWAY_URL" -user="$env:FLYWAY_USER" -password="$env:FLYWAY_PASSWORD" `
+              migrate
+          }
+
+ #── PROD (za bramką Approve) ──────────────────────────────
+  migrate-prod:
+    needs: migrate-dev
+    runs-on: [self-hosted, optiplex]
+    environment: prod          # Approve gate
+    env:
+      FLYWAY_URL: "${{ vars.PKP_FLYWAY_URL_PROD }}"
+      FLYWAY_USER: ${{ vars.PKP_FLYWAY_USER_PROD }} 
+      FLYWAY_PASSWORD: ${{ secrets.PKP_ADMIN_PASSWORD_PROD }}
+      WALLET_DIR: ${{ vars.PKP_WALLET_DIR_LOCAL_PROD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Flyway migrate (5 projektow) na PKPPROD
+        shell: powershell -ExecutionPolicy Bypass -Command "& '{0}'"
+        run: |
+          foreach ($p in "admin","stg","maintenance","silver","gold") {
+            Write-Host "=== migrate: $p ==="
+            docker run --rm `
+              -v "${{ github.workspace }}:/repo" `
+              -v "${env:WALLET_DIR}:/wallet:ro" `
+              redgate/flyway:11 `
+              "-configFiles=/repo/migrations/$p/conf/flyway.conf" `
+              "-locations=filesystem:/repo/migrations/$p/sql" `
+              -url="$env:FLYWAY_URL" -user="$env:FLYWAY_USER" -password="$env:FLYWAY_PASSWORD" `
+              migrate
+          }

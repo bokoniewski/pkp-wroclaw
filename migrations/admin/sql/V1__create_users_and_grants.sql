@@ -1,0 +1,114 @@
+-- =============================================================================
+-- V1__create_users_and_grants.sql
+-- -----------------------------------------------------------------------------
+-- Bootstrap uprawnien na Oracle Autonomous DB (ADB). Uruchamiane RAZ, jako ADMIN,
+-- przed pierwsza migracja Flyway. Tworzy schematy warstw hurtowni i konto
+-- deweloperskie, po czym nadaje mu uprawnienia do pracy na tych schematach.
+--
+-- Schematy (warstwy pipeline'u):
+--   stg         - landing surowych danych z bucketu (bronze -> staging)
+--   silver      - dane oczyszczone / tracking
+--   gold        - wymiary i fakty (warstwa analityczna)
+--   maintenance - narzedzia utrzymaniowe (kolejka DDL, logi, reorg tabel/indeksow)
+-- Schematy sa NO AUTHENTICATION - nie loguje sie do nich bezposrednio; wlascicielem
+-- obiektow jest schemat, a pracuje na nich konto dev_app przez GRANT-y ANY.
+--
+-- dev_app - konto aplikacyjne/deweloperskie (login), przez ktore Python (ingestion/
+--   db.py) i Flyway operuja na wszystkich warstwach. Dostaje uprawnienia obiektowe
+--   (CREATE/ALTER/DROP/DML) per schemat oraz SELECT na widokach slownikowych SYS.DBA_*
+--   (potrzebne warstwie maintenance do analizy fragmentacji tabel/indeksow).
+--
+-- Uwaga: <haslo> dla dev_app podstaw recznie.
+-- =============================================================================
+
+
+-- schematy
+CREATE USER IF NOT EXISTS stg   NO AUTHENTICATION;
+CREATE USER IF NOT EXISTS silver NO AUTHENTICATION;
+CREATE USER IF NOT EXISTS gold   NO AUTHENTICATION;
+CREATE USER IF NOT EXISTS maintenance   NO AUTHENTICATION;
+ALTER USER stg QUOTA UNLIMITED ON DATA;
+ALTER USER silver QUOTA UNLIMITED ON DATA;
+ALTER USER gold   QUOTA UNLIMITED ON DATA;
+ALTER USER maintenance   QUOTA UNLIMITED ON DATA;
+
+-- user (konto deweloperskie)
+CREATE USER IF NOT EXISTS dev_app IDENTIFIED BY <haslo>;
+GRANT CREATE SESSION, DWROLE TO dev_app;
+ALTER USER dev_app QUOTA UNLIMITED ON DATA;
+
+
+-- procedury / funkcje / pakiety
+GRANT CREATE ANY PROCEDURE, ALTER ANY PROCEDURE, DROP ANY PROCEDURE, EXECUTE ANY PROCEDURE TO dev_app;
+
+-- triggery
+GRANT CREATE ANY TRIGGER, ALTER ANY TRIGGER, DROP ANY TRIGGER TO dev_app;
+
+-- typy (przydatne przy pakietach / kolekcjach)
+GRANT CREATE ANY TYPE, ALTER ANY TYPE, DROP ANY TYPE, EXECUTE ANY TYPE TO dev_app;
+
+-- materialized views (częste w warstwie gold pod agregaty)
+GRANT CREATE ANY MATERIALIZED VIEW, ALTER ANY MATERIALIZED VIEW, DROP ANY MATERIALIZED VIEW TO dev_app;
+GRANT GLOBAL QUERY REWRITE TO dev_app;   -- pod query rewrite dla MV
+
+-- synonimy (jeśli będziesz chciał aliasować obiekty między schematami)
+GRANT CREATE ANY SYNONYM, DROP ANY SYNONYM TO dev_app;
+
+-- proste joby (DBMS_JOB-style) — zwykle już w DWROLE, ale dokładamy dla pewności
+GRANT CREATE JOB TO dev_app;
+
+-- pełny Scheduler (DBMS_SCHEDULER: harmonogramy, programy, okna) — jeśli chcesz zarządzać jobami też w cudzych schematach
+GRANT CREATE ANY JOB, MANAGE SCHEDULER TO dev_app;
+GRANT EXECUTE ON DBMS_SCHEDULER TO dev_app;
+
+
+-- STG
+GRANT SELECT ANY TABLE ON SCHEMA stg TO dev_app;
+GRANT INSERT ANY TABLE, UPDATE ANY TABLE, DELETE ANY TABLE ON SCHEMA stg TO dev_app;
+GRANT CREATE ANY TABLE, ALTER ANY TABLE, DROP ANY TABLE ON SCHEMA stg TO dev_app;
+GRANT CREATE ANY SEQUENCE, ALTER ANY SEQUENCE, DROP ANY SEQUENCE, SELECT ANY SEQUENCE ON SCHEMA stg TO dev_app;
+GRANT CREATE ANY INDEX, ALTER ANY INDEX, DROP ANY INDEX ON SCHEMA stg TO dev_app;
+GRANT CREATE ANY VIEW, DROP ANY VIEW ON SCHEMA stg TO dev_app;
+
+-- SILVER
+GRANT SELECT ANY TABLE ON SCHEMA silver TO dev_app;
+GRANT INSERT ANY TABLE, UPDATE ANY TABLE, DELETE ANY TABLE ON SCHEMA silver TO dev_app;
+GRANT CREATE ANY TABLE, ALTER ANY TABLE, DROP ANY TABLE ON SCHEMA silver TO dev_app;
+GRANT CREATE ANY SEQUENCE, ALTER ANY SEQUENCE, DROP ANY SEQUENCE, SELECT ANY SEQUENCE ON SCHEMA silver TO dev_app;
+GRANT CREATE ANY INDEX, ALTER ANY INDEX, DROP ANY INDEX ON SCHEMA silver TO dev_app;
+GRANT CREATE ANY VIEW, DROP ANY VIEW ON SCHEMA silver TO dev_app;
+
+-- GOLD
+GRANT SELECT ANY TABLE ON SCHEMA gold TO dev_app;
+GRANT INSERT ANY TABLE, UPDATE ANY TABLE, DELETE ANY TABLE ON SCHEMA gold TO dev_app;
+GRANT CREATE ANY TABLE, ALTER ANY TABLE, DROP ANY TABLE ON SCHEMA gold TO dev_app;
+GRANT CREATE ANY SEQUENCE, ALTER ANY SEQUENCE, DROP ANY SEQUENCE, SELECT ANY SEQUENCE ON SCHEMA gold TO dev_app;
+GRANT CREATE ANY INDEX, ALTER ANY INDEX, DROP ANY INDEX ON SCHEMA gold TO dev_app;
+GRANT CREATE ANY VIEW, DROP ANY VIEW ON SCHEMA gold TO dev_app;
+
+
+-- MAINTENANCE
+GRANT SELECT ANY TABLE ON SCHEMA maintenance TO dev_app;
+GRANT INSERT ANY TABLE, UPDATE ANY TABLE, DELETE ANY TABLE ON SCHEMA maintenance TO dev_app;
+GRANT CREATE ANY TABLE, ALTER ANY TABLE, DROP ANY TABLE ON SCHEMA maintenance TO dev_app;
+GRANT CREATE ANY SEQUENCE, ALTER ANY SEQUENCE, DROP ANY SEQUENCE, SELECT ANY SEQUENCE ON SCHEMA maintenance TO dev_app;
+GRANT CREATE ANY INDEX, ALTER ANY INDEX, DROP ANY INDEX ON SCHEMA maintenance TO dev_app;
+GRANT CREATE ANY VIEW, DROP ANY VIEW ON SCHEMA maintenance TO dev_app;
+GRANT ANALYZE ANY TO dev_app;
+GRANT SELECT ON SYS.DBA_TABLES         TO dev_app;
+GRANT SELECT ON SYS.DBA_TAB_COLUMNS    TO dev_app;
+GRANT SELECT ON SYS.DBA_PART_KEY_COLUMNS TO dev_app;
+GRANT SELECT ON SYS.DBA_TAB_PARTITIONS TO dev_app;
+GRANT SELECT ON SYS.DBA_SEGMENTS       TO dev_app;
+GRANT SELECT ON SYS.DBA_INDEXES       TO dev_app;
+
+GRANT ANALYZE ANY TO maintenance;
+GRANT SELECT ON SYS.DBA_TABLES         TO maintenance;
+GRANT SELECT ON SYS.DBA_TAB_COLUMNS    TO maintenance;
+GRANT SELECT ON SYS.DBA_PART_KEY_COLUMNS TO maintenance;
+GRANT SELECT ON SYS.DBA_TAB_PARTITIONS TO maintenance;
+GRANT SELECT ON SYS.DBA_SEGMENTS       TO maintenance;
+GRANT SELECT ON SYS.DBA_INDEXES       TO maintenance;
+
+
+

@@ -1,0 +1,1123 @@
+-- =====================================================================
+-- PKG_GOLD_LOAD - ladowanie wymiarow warstwy GOLD ze SILVER.
+--
+-- Konwencje (spojne z pkg_silver_load):
+--   * wymiary generowane (d_date, d_hour) -> INSERT idempotentny (WHERE NOT EXISTS)
+--   * wymiary ze silver                    -> MERGE (upsert) + no-op skip (DECODE null-safe)
+--   * d_train_type                         -> SCD2 (wersje przewoznika z def_carrier)
+--   * loaded_at -> pkg_tool.f_now_warsaw
+--   * bez prefiksow schematow -> przez SYNONIMY
+--   * log_rows -> nazwa kroku z UTL_CALL_STACK
+--
+-- Owner: GOLD. AUTHID DEFINER. load_dimensions: DISABLE PARALLEL DML + jeden COMMIT.
+-- Repeatable migration Flyway.
+-- =====================================================================
+
+-- ---- granty (synonimy nie nadaja uprawnien) ----
+grant execute on maintenance.pkg_tool               to gold;
+grant select  on silver.def_station                 to gold;
+grant select  on silver.def_city                    to gold;
+grant select  on silver.schedule_header            	to gold;
+grant select  on silver.schedule_details            to gold;
+grant select  on silver.def_commercial_category     to gold;
+grant select  on silver.def_carrier                 to gold;
+grant select  on silver.def_train_status            to gold;
+grant select  on silver.def_disruption_cause        to gold;
+grant select on silver.operation_header  			to gold;
+grant select on silver.operation_details 			to gold;
+grant select on silver.disruption_header  			to gold;
+grant select on silver.disruption_details 			to gold;
+
+
+
+-- ---- synonimy: kod pakietu bez prefiksow schematow ----
+CREATE OR REPLACE SYNONYM gold.pkg_tool                 FOR maintenance.pkg_tool;
+CREATE OR REPLACE SYNONYM gold.def_station             	FOR silver.def_station;
+CREATE OR REPLACE SYNONYM gold.def_city                	FOR silver.def_city;
+CREATE OR REPLACE SYNONYM gold.schedule_header         	FOR silver.schedule_header;
+CREATE OR REPLACE SYNONYM gold.schedule_details        	FOR silver.schedule_details;
+CREATE OR REPLACE SYNONYM gold.def_commercial_category 	FOR silver.def_commercial_category;
+CREATE OR REPLACE SYNONYM gold.def_carrier             	FOR silver.def_carrier;
+CREATE OR REPLACE SYNONYM gold.def_train_status        	FOR silver.def_train_status;
+CREATE OR REPLACE SYNONYM gold.def_disruption_cause    	FOR silver.def_disruption_cause;
+CREATE OR REPLACE SYNONYM gold.operation_header  		FOR silver.operation_header;
+CREATE OR REPLACE SYNONYM gold.operation_details 		FOR silver.operation_details;
+CREATE OR REPLACE SYNONYM gold.disruption_header  		FOR silver.disruption_header;
+CREATE OR REPLACE SYNONYM gold.disruption_details 		FOR silver.disruption_details;
+
+
+
+
+create or replace PACKAGE gold.pkg_gold_load AUTHID DEFINER AS
+
+    c_default_days CONSTANT NUMBER := 3;
+    c_full_load CONSTANT BOOLEAN := FALSE;
+
+    PROCEDURE p_load_d_date;
+    PROCEDURE p_load_d_hour;
+    PROCEDURE p_load_d_station;
+    PROCEDURE p_load_d_route (p_full_load IN BOOLEAN DEFAULT c_full_load);
+    PROCEDURE p_load_d_train_type;
+    PROCEDURE p_load_d_train_status;
+    PROCEDURE p_load_d_disruption_cause;
+    PROCEDURE p_load_dimensions (p_full_load IN BOOLEAN DEFAULT c_full_load);
+
+    PROCEDURE p_load_f_train_run_daily(p_days IN NUMBER DEFAULT c_default_days);
+	PROCEDURE p_load_f_train_stop_daily(p_days IN NUMBER DEFAULT c_default_days);
+	PROCEDURE p_load_f_train_disruption_daily(p_days IN NUMBER DEFAULT c_default_days);
+    PROCEDURE p_load_f_train_dep_daily(p_days IN NUMBER DEFAULT c_default_days);
+    PROCEDURE p_load_facts_daily (p_days IN NUMBER DEFAULT c_default_days);
+    
+    PROCEDURE p_load_f_train_run_monthly(p_days IN NUMBER DEFAULT c_default_days);
+    PROCEDURE p_load_f_train_stop_monthly(p_days IN NUMBER DEFAULT c_default_days);
+    PROCEDURE p_load_f_train_disruption_monthly(p_days IN NUMBER DEFAULT c_default_days);
+    PROCEDURE p_load_f_train_dep_monthly(p_days IN NUMBER DEFAULT c_default_days);
+    PROCEDURE p_load_facts_monthly (p_days IN NUMBER DEFAULT c_default_days);
+
+END pkg_gold_load;
+/
+
+
+
+create or replace PACKAGE BODY gold.pkg_gold_load AS
+    
+    /**********************************************************************************************************/
+    /***** Zmienne stałe  *****/
+    /**********************************************************************************************************/
+    c_valid_to CONSTANT DATE := DATE '2999-12-31';
+    c_parallel_dml CONSTANT VARCHAR2(100 CHAR) := 'ALTER SESSION DISABLE PARALLEL DML';
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_log_rows  *****/
+    /**********************************************************************************************************/
+    -- log do DBMS_OUTPUT; nazwa kroku = wolajaca procedura (z call stacku)
+    PROCEDURE p_log_rows(p_rows IN NUMBER) IS
+        v_full VARCHAR2(200);
+        v_step VARCHAR2(128);
+    BEGIN
+        v_full := UTL_CALL_STACK.concatenate_subprogram( UTL_CALL_STACK.subprogram(2) );
+        v_step := LOWER( SUBSTR(v_full, INSTR(v_full, '.') + 1) );
+        DBMS_OUTPUT.PUT_LINE( RPAD(v_step, 32) || ' -> ' || p_rows || ' wierszy' );
+    END p_log_rows;
+
+
+
+    -- ================= WYMIARY GENEROWANE =================
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_d_date  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_d_date IS
+        v_start DATE := TRUNC(SYSDATE, 'YYYY');                     -- 1 stycznia roku biezacego
+        v_end   DATE := ADD_MONTHS(TRUNC(SYSDATE,'YYYY'), 24) - 1;  -- 31 grudnia roku przyszlego
+    BEGIN
+        INSERT INTO d_date (
+            id, full_date, year, quarter, month, month_name,
+            day, day_of_week, day_name, iso_week, is_weekend, loaded_at
+        )
+        SELECT
+            TO_NUMBER(TO_CHAR(g.d,'YYYYMMDD')),
+            g.d,
+            EXTRACT(YEAR  FROM g.d),
+            TO_NUMBER(TO_CHAR(g.d,'Q')),
+            EXTRACT(MONTH FROM g.d),
+            INITCAP(TRIM(TO_CHAR(g.d,'fmMonth','NLS_DATE_LANGUAGE=POLISH'))),
+            EXTRACT(DAY   FROM g.d),
+            (TRUNC(g.d) - TRUNC(g.d,'IW') + 1),                    -- 1=pon ... 7=niedz
+            INITCAP(TRIM(TO_CHAR(g.d,'fmDay','NLS_DATE_LANGUAGE=POLISH'))),
+            TO_NUMBER(TO_CHAR(g.d,'IW')),
+            CASE WHEN (TRUNC(g.d) - TRUNC(g.d,'IW') + 1) IN (6,7) THEN 'T' ELSE 'N' END,
+            pkg_tool.f_now_warsaw
+        FROM (
+            SELECT v_start + (LEVEL - 1) AS d
+            FROM dual
+            CONNECT BY LEVEL <= (v_end - v_start + 1)
+        ) g
+        WHERE NOT EXISTS (
+            SELECT 1 FROM d_date x WHERE x.id = TO_NUMBER(TO_CHAR(g.d,'YYYYMMDD'))
+        );
+        p_log_rows(SQL%ROWCOUNT);
+    END p_load_d_date;
+
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_d_hour  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_d_hour IS
+    BEGIN
+        INSERT INTO d_hour (id, hour_label, part_of_day, loaded_at)
+        SELECT g.h,
+               LPAD(g.h,2,'0') || ':00-' || LPAD(g.h,2,'0') || ':59',
+               CASE
+                   WHEN g.h BETWEEN 0  AND 4  THEN 'noc'
+                   WHEN g.h BETWEEN 5  AND 8  THEN 'szczyt poranny'
+                   WHEN g.h BETWEEN 9  AND 14 THEN 'dzień'
+                   WHEN g.h BETWEEN 15 AND 18 THEN 'szczyt popołudniowy'
+                   ELSE 'wieczór'
+               END,
+               pkg_tool.f_now_warsaw
+        FROM ( SELECT LEVEL - 1 AS h FROM dual CONNECT BY LEVEL <= 24 ) g
+        WHERE NOT EXISTS ( SELECT 1 FROM d_hour x WHERE x.id = g.h );
+        p_log_rows(SQL%ROWCOUNT);
+    END p_load_d_hour;
+
+
+
+
+
+    -- ================= WYMIARY ZE SILVER (MERGE + no-op skip) =================
+    
+    /**********************************************************************************************************/
+    /***** p_load_d_station  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_d_station IS
+    BEGIN
+        MERGE INTO d_station d
+        USING (
+            select s.id, s.name as station_name, c.name as city_name
+            from   def_station s
+            left join def_city c on c.id = s.dcit_id
+        ) s
+        ON (d.id = s.id)
+        WHEN MATCHED THEN UPDATE SET
+            d.station_name = s.station_name, d.city_name = s.city_name, d.loaded_at = pkg_tool.f_now_warsaw
+            WHERE DECODE(d.station_name, s.station_name, 0, 1) = 1
+               OR DECODE(d.city_name,    s.city_name,    0, 1) = 1
+        WHEN NOT MATCHED THEN
+            INSERT (id, station_name, city_name, loaded_at)
+            VALUES (s.id, s.station_name, s.city_name, pkg_tool.f_now_warsaw);
+        p_log_rows(SQL%ROWCOUNT);
+    END p_load_d_station;
+
+
+
+    /**********************************************************************************************************/
+    /***** p_load_d_route  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_d_route(p_full_load IN BOOLEAN DEFAULT c_full_load) IS
+    BEGIN
+        IF p_full_load THEN
+            -- PELNY: cala historia rozkladu (jednorazowo). Skanuje cale schedule_details.
+            MERGE INTO d_route d
+            USING (
+                with ep as (
+                    select schedule_id, order_id,
+                           min(order_number) as min_on,
+                           max(order_number) as max_on
+                    from   schedule_details
+                    group by schedule_id, order_id
+                )
+                select distinct f.dsta_id as from_station_id, t.dsta_id as to_station_id
+                from   ep
+                join   schedule_details f
+                       on f.schedule_id = ep.schedule_id and f.order_id = ep.order_id and f.order_number = ep.min_on
+                join   schedule_details t
+                       on t.schedule_id = ep.schedule_id and t.order_id = ep.order_id and t.order_number = ep.max_on
+            ) s
+            ON (d.from_station_id = s.from_station_id AND d.to_station_id = s.to_station_id)
+            WHEN NOT MATCHED THEN
+                INSERT (from_station_id, to_station_id, loaded_at)
+                VALUES (s.from_station_id, s.to_station_id, pkg_tool.f_now_warsaw);
+        ELSE
+            -- DZIENNY (domyslny): tylko kursy jadace DZIS - driver ze schedule_header,
+            -- join do schedule_details po (schedule_id, order_id) => bez skanu calej tabeli.
+            MERGE INTO d_route d
+            USING (
+                with ord as (
+                    select distinct schedule_id, order_id
+                    from   schedule_header
+                    where  operating_date = trunc(sysdate)
+                ),
+                ep as (
+                    select sd.schedule_id, sd.order_id,
+                           min(sd.order_number) as min_on,
+                           max(sd.order_number) as max_on
+                    from   schedule_details sd
+                    join   ord on ord.schedule_id = sd.schedule_id and ord.order_id = sd.order_id
+                    group by sd.schedule_id, sd.order_id
+                )
+                select distinct f.dsta_id as from_station_id, t.dsta_id as to_station_id
+                from   ep
+                join   schedule_details f
+                       on f.schedule_id = ep.schedule_id and f.order_id = ep.order_id and f.order_number = ep.min_on
+                join   schedule_details t
+                       on t.schedule_id = ep.schedule_id and t.order_id = ep.order_id and t.order_number = ep.max_on
+            ) s
+            ON (d.from_station_id = s.from_station_id AND d.to_station_id = s.to_station_id)
+            WHEN NOT MATCHED THEN
+                INSERT (from_station_id, to_station_id, loaded_at)
+                VALUES (s.from_station_id, s.to_station_id, pkg_tool.f_now_warsaw);
+        END IF;
+
+        p_log_rows(SQL%ROWCOUNT);
+    END p_load_d_route;
+
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_d_train_type  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_d_train_type IS
+    BEGIN
+        -- SCD2: kazda kategoria x kazda wersja przewoznika (valid_from/valid_to z def_carrier)
+        MERGE INTO d_train_type d
+        USING (
+            -- 1) kategorie ze slownika
+            select cc.code                as category_code,
+                   cc.name                as category_name,
+                   cc.speed_category_code as speed_category_code,
+                   ca.code                as carrier_code,
+                   ca.name                as carrier_name,
+                   ca.valid_from          as valid_from,
+                   ca.valid_to            as valid_to
+            from   def_commercial_category cc
+            join   def_carrier ca on ca.code = cc.carrier_code
+            union all
+            -- 2) kategorie zlozone z rozkladu (np. EC/IC), ktorych nie ma w slowniku;
+            --    nazwa = nazwy czesci ze slownika rozdzielone ' / ' (brak w slowniku -> sam kod czesci)
+            select x.category_code,
+                   coalesce(p1.name, regexp_substr(x.category_code, '[^/]+', 1, 1))
+                     || ' / ' ||
+                   coalesce(p2.name, regexp_substr(x.category_code, '[^/]+', 1, 2)) as category_name,
+                   p1.speed_category_code,
+                   ca.code, ca.name, ca.valid_from, ca.valid_to
+            from  (select distinct sh.category_code, sh.carrier_code
+                     from schedule_header sh
+                    where instr(sh.category_code, '/') > 0
+                      and not exists (select 1 from def_commercial_category cc
+                                       where cc.code         = sh.category_code
+                                         and cc.carrier_code = sh.carrier_code)) x
+            join   def_carrier ca on ca.code = x.carrier_code
+            left join def_commercial_category p1
+                   on p1.code = regexp_substr(x.category_code, '[^/]+', 1, 1) and p1.carrier_code = x.carrier_code
+            left join def_commercial_category p2
+                   on p2.code = regexp_substr(x.category_code, '[^/]+', 1, 2) and p2.carrier_code = x.carrier_code
+        ) s
+        ON (    d.category_code = s.category_code
+            AND d.carrier_code  = s.carrier_code
+            AND d.valid_from    = s.valid_from )
+        WHEN MATCHED THEN UPDATE SET
+            d.category_name = s.category_name, d.speed_category_code = s.speed_category_code,
+            d.carrier_name  = s.carrier_name,  d.valid_to = s.valid_to, d.loaded_at = pkg_tool.f_now_warsaw
+            WHERE DECODE(d.category_name,       s.category_name,       0, 1) = 1
+               OR DECODE(d.speed_category_code, s.speed_category_code, 0, 1) = 1
+               OR DECODE(d.carrier_name,        s.carrier_name,        0, 1) = 1
+               OR DECODE(d.valid_to,            s.valid_to,            0, 1) = 1
+        WHEN NOT MATCHED THEN
+            INSERT (category_code, category_name, speed_category_code, carrier_code, carrier_name, valid_from, valid_to, loaded_at)
+            VALUES (s.category_code, s.category_name, s.speed_category_code, s.carrier_code, s.carrier_name, s.valid_from, s.valid_to, pkg_tool.f_now_warsaw);
+        p_log_rows(SQL%ROWCOUNT);
+    END p_load_d_train_type;
+
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_d_train_status  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_d_train_status IS
+    BEGIN
+        MERGE INTO d_train_status d
+        USING (
+            select code as status_code, name as status_name from def_train_status
+        ) s
+        ON (d.status_code = s.status_code)
+        WHEN MATCHED THEN UPDATE SET d.status_name = s.status_name, d.loaded_at = pkg_tool.f_now_warsaw
+            WHERE DECODE(d.status_name, s.status_name, 0, 1) = 1
+        WHEN NOT MATCHED THEN
+            INSERT (status_code, status_name, loaded_at)
+            VALUES (s.status_code, s.status_name, pkg_tool.f_now_warsaw);
+        p_log_rows(SQL%ROWCOUNT);
+    END p_load_d_train_status;
+
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_d_disruption_cause  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_d_disruption_cause IS
+    BEGIN
+        MERGE INTO d_disruption_cause d
+        USING (
+            select code as cause_code, description as cause_name from def_disruption_cause
+        ) s
+        ON (d.cause_code = s.cause_code)
+        WHEN MATCHED THEN UPDATE SET d.cause_name = s.cause_name, d.loaded_at = pkg_tool.f_now_warsaw
+            WHERE DECODE(d.cause_name, s.cause_name, 0, 1) = 1
+        WHEN NOT MATCHED THEN
+            INSERT (cause_code, cause_name, loaded_at)
+            VALUES (s.cause_code, s.cause_name, pkg_tool.f_now_warsaw);
+        p_log_rows(SQL%ROWCOUNT);
+    END p_load_d_disruption_cause;
+	
+	-- ================= WYMIARY GENEROWANE =================
+    
+    
+    
+    
+    -- ================= FAKTY =================
+    
+    /**********************************************************************************************************/
+    /***** p_load_f_train_run_daily  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_f_train_run_daily(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from DATE;
+        v_to   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;   -- Autonomous: ORA-12839
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        DELETE FROM f_train_run_daily
+        WHERE date_id BETWEEN TO_NUMBER(TO_CHAR(v_from,'YYYYMMDD')) AND TO_NUMBER(TO_CHAR(v_to,'YYYYMMDD'));
+
+        INSERT INTO f_train_run_daily
+            (date_id, route_id, train_type_id, status_id,
+             runs_count, delayed_count, sum_terminal_delay_min, sum_delayed_delay_min, max_terminal_delay_min,
+             travel_runs_count, sum_planned_travel_min, sum_actual_travel_min, min_actual_travel_min, max_actual_travel_min,
+             loaded_at)
+        WITH runs AS (       -- jeden wiersz na kurs w oknie + atrybuty z rozkladu
+            select oh.id as ophe_id,
+                   oh.operating_date,
+                   to_number(to_char(oh.operating_date,'YYYYMMDD')) as date_id,
+                   oh.schedule_id, oh.order_id, oh.train_status,
+                   sh.category_code, sh.carrier_code
+            from operation_header oh
+            join schedule_header sh
+              on  sh.operating_date = oh.operating_date
+              and sh.schedule_id    = oh.schedule_id
+              and sh.order_id       = oh.order_id
+              and sh.train_order_id = oh.train_order_id
+            where oh.operating_date between v_from and v_to
+        ),
+        ep AS (              -- endpointy rozkladu tylko dla kursow z okna
+            select sd.schedule_id, sd.order_id,
+                   min(sd.order_number) as min_on, max(sd.order_number) as max_on
+            from schedule_details sd
+            where (sd.schedule_id, sd.order_id) in (select schedule_id, order_id from runs)
+            group by sd.schedule_id, sd.order_id
+        ),
+        route_pair AS (      -- from/to stacja per (schedule_id, order_id)
+            select ep.schedule_id, ep.order_id, f.dsta_id as from_station_id, t.dsta_id as to_station_id
+            from ep
+            join schedule_details f on f.schedule_id=ep.schedule_id and f.order_id=ep.order_id and f.order_number=ep.min_on
+            join schedule_details t on t.schedule_id=ep.schedule_id and t.order_id=ep.order_id and t.order_number=ep.max_on
+        ),
+        sched_span AS (      -- PLANOWANE: zegar + offset dnia (kolumny *_at bywaja NULL)
+            select ep.schedule_id, ep.order_id,
+                   dep.departure_time as dep_time, dep.departure_day as dep_day,
+                   arr.arrival_time   as arr_time, arr.arrival_day   as arr_day
+            from ep
+            join schedule_details dep on dep.schedule_id=ep.schedule_id and dep.order_id=ep.order_id and dep.order_number=ep.min_on
+            join schedule_details arr on arr.schedule_id=ep.schedule_id and arr.order_id=ep.order_id and arr.order_number=ep.max_on
+        ),
+        op_span AS (         -- RZECZYWISTE: pierwszy/ostatni POTWIERDZONY przystanek + ich pozycja w planie
+            select ophe_id,
+                   max(actual_departure) keep (dense_rank first order by actual_sequence) as origin_dep_at,
+                   max(planned_sequence) keep (dense_rank first order by actual_sequence) as origin_ps,
+                   max(actual_arrival)   keep (dense_rank last  order by actual_sequence) as term_arr_at,
+                   max(planned_sequence) keep (dense_rank last  order by actual_sequence) as term_ps
+            from operation_details
+            where is_confirmed = 1
+            group by ophe_id
+        ),
+        term AS (            -- opoznienie terminalne = ostatni potwierdzony przystanek
+            select ophe_id, nvl(arrival_delay_min, 0) as terminal_delay
+            from operation_details
+            where is_confirmed = 1
+            qualify row_number() over (partition by ophe_id order by actual_sequence desc) = 1
+        ),
+        resolved AS (        -- mapowanie na klucze wymiarow + czasy przejazdu per kurs [min]
+            select r.date_id,
+                   dr.id                    as route_id,
+                   coalesce(ttm.id, ttc.id) as train_type_id,
+                   dts.id                   as status_id,
+                   tm.terminal_delay,
+                   -- planowany czas przejazdu [min]: (arrival na terminalu) - (departure z origin), z offsetem dnia
+                   case when ss.dep_time is not null and ss.arr_time is not null
+                        then ( nvl(ss.arr_day,0)*1440 + to_number(substr(ss.arr_time,1,2))*60 + to_number(substr(ss.arr_time,4,2)) )
+                           - ( nvl(ss.dep_day,0)*1440 + to_number(substr(ss.dep_time,1,2))*60 + to_number(substr(ss.dep_time,4,2)) )
+                        end as planned_travel_min,
+                   -- rzeczywisty czas przejazdu [min]: pelna trasa; niezmierzony koniec (np. stacja zagraniczna)
+                   -- uzupelniony z rozkladu (start: plan, koniec: plan + ostatnie znane opoznienie). Tylko kursy 'C'.
+                   case when r.train_status = 'C'
+                         and os.ophe_id is not null
+                         and ss.dep_time is not null and ss.arr_time is not null
+                        then round((
+                               case when os.term_ps = e.max_on and os.term_arr_at is not null
+                                    then cast(os.term_arr_at as date)
+                                    else r.operating_date + nvl(ss.arr_day,0)
+                                         + (to_number(substr(ss.arr_time,1,2))*60 + to_number(substr(ss.arr_time,4,2))) / 1440
+                                         + nvl(tm.terminal_delay,0) / 1440
+                               end
+                             - case when os.origin_ps = e.min_on and os.origin_dep_at is not null
+                                    then cast(os.origin_dep_at as date)
+                                    else r.operating_date + nvl(ss.dep_day,0)
+                                         + (to_number(substr(ss.dep_time,1,2))*60 + to_number(substr(ss.dep_time,4,2))) / 1440
+                               end
+                             ) * 1440)
+                   end as actual_travel_min
+            from runs r
+            left join term       tm on tm.ophe_id = r.ophe_id
+            left join op_span    os on os.ophe_id = r.ophe_id
+            left join route_pair rp on rp.schedule_id = r.schedule_id and rp.order_id = r.order_id
+            left join sched_span ss on ss.schedule_id = r.schedule_id and ss.order_id = r.order_id
+            left join ep         e  on e.schedule_id  = r.schedule_id and e.order_id  = r.order_id
+            join d_route dr on dr.from_station_id = rp.from_station_id and dr.to_station_id = rp.to_station_id
+            left join d_train_type ttm
+                   on ttm.category_code = r.category_code and ttm.carrier_code = r.carrier_code
+                  and r.operating_date between ttm.valid_from and ttm.valid_to
+            left join d_train_type ttc
+                   on ttc.category_code = r.category_code and ttc.carrier_code = r.carrier_code
+                  and ttc.valid_to = c_valid_to
+            join d_train_status dts on dts.status_code = r.train_status
+        )
+        select date_id, route_id, train_type_id, status_id,
+               count(*)                                                                             as runs_count,
+               case when count(terminal_delay) = 0 then null
+                    else sum(case when terminal_delay >= 6 then 1 else 0 end) end                   as delayed_count,
+               sum(terminal_delay)                                                                  as sum_terminal_delay_min,
+               case when count(terminal_delay) = 0 then null
+                    else nvl(sum(case when terminal_delay >= 6 then terminal_delay end), 0) end     as sum_delayed_delay_min,
+               max(terminal_delay)                                                                  as max_terminal_delay_min,
+               -- miary czasu przejazdu (mianownik = kursy z policzalnym RZECZYWISTYM czasem)
+               case when count(actual_travel_min) = 0 then null else count(actual_travel_min) end   as travel_runs_count,
+               sum(case when actual_travel_min is not null then planned_travel_min end)             as sum_planned_travel_min,
+               sum(actual_travel_min)                                                               as sum_actual_travel_min,
+               min(actual_travel_min)                                                               as min_actual_travel_min,
+               max(actual_travel_min)                                                               as max_actual_travel_min,
+               pkg_tool.f_now_warsaw
+        from resolved
+        where train_type_id is not null
+        group by date_id, route_id, train_type_id, status_id;
+
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_run_daily ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_run_daily;
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_f_train_stop_daily  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_f_train_stop_daily(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from DATE;
+        v_to   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;
+
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        DELETE FROM f_train_stop_daily
+         WHERE date_id BETWEEN TO_NUMBER(TO_CHAR(v_from,'YYYYMMDD'))
+                           AND TO_NUMBER(TO_CHAR(v_to,  'YYYYMMDD'));
+
+        INSERT INTO f_train_stop_daily
+            (date_id, route_id, train_type_id, station_id, hour_id,
+             arrivals_count, arrivals_on_time, arrivals_delayed,
+             sum_arrival_delay_min, sum_delayed_delay_min, max_arrival_delay_min, cancelled_count, loaded_at)
+        WITH runs AS (            -- kursy w oknie + atrybuty z rozkladu
+            select oh.id as ophe_id,
+                   oh.operating_date,
+                   to_number(to_char(oh.operating_date,'YYYYMMDD')) as date_id,
+                   oh.schedule_id, oh.order_id,
+                   sh.category_code, sh.carrier_code
+            from operation_header oh
+            join schedule_header sh
+              on  sh.operating_date = oh.operating_date and sh.schedule_id = oh.schedule_id
+              and sh.order_id       = oh.order_id       and sh.train_order_id = oh.train_order_id
+            where oh.operating_date between v_from and v_to
+        ),
+        ep AS (
+            select sd.schedule_id, sd.order_id,
+                   min(sd.order_number) as min_on, max(sd.order_number) as max_on
+            from schedule_details sd
+            where (sd.schedule_id, sd.order_id) in (select schedule_id, order_id from runs)
+            group by sd.schedule_id, sd.order_id
+        ),
+        route_pair AS (
+            select ep.schedule_id, ep.order_id, f.dsta_id as from_station_id, t.dsta_id as to_station_id
+            from ep
+            join schedule_details f on f.schedule_id=ep.schedule_id and f.order_id=ep.order_id and f.order_number=ep.min_on
+            join schedule_details t on t.schedule_id=ep.schedule_id and t.order_id=ep.order_id and t.order_number=ep.max_on
+        ),
+        stops AS (                -- przystanki (nie-origin) z planowa godzina przyjazdu
+            select r.date_id, r.schedule_id, r.order_id, r.operating_date,
+                   r.category_code, r.carrier_code,
+                   od.dsta_id                              as station_id,
+                   to_number(substr(sd.arrival_time,1,2)) as hour_id,
+                   case when od.is_confirmed and not od.is_cancelled
+                         and od.actual_arrival is not null then 1 else 0 end                  as is_arrival,
+                   case when od.is_confirmed and not od.is_cancelled
+                         and od.actual_arrival is not null then nvl(od.arrival_delay_min,0) end as eff_delay,
+                   case when od.is_cancelled then 1 else 0 end as is_cancelled
+            from runs r
+            join operation_details od on od.ophe_id = r.ophe_id
+            join schedule_details sd
+              on sd.schedule_id = r.schedule_id and sd.order_id = r.order_id
+             and sd.order_number = od.planned_sequence
+            where sd.arrival_time is not null              -- pomija origin (start bez przyjazdu)
+        ),
+        resolved AS (
+            select s.date_id,
+                   dr.id                    as route_id,
+                   coalesce(ttm.id, ttc.id) as train_type_id,
+                   s.station_id,
+                   s.hour_id,
+                   s.is_arrival, s.eff_delay, s.is_cancelled
+            from stops s
+            left join route_pair rp on rp.schedule_id = s.schedule_id and rp.order_id = s.order_id
+            join d_route dr on dr.from_station_id = rp.from_station_id and dr.to_station_id = rp.to_station_id
+            left join d_train_type ttm
+                   on ttm.category_code = s.category_code and ttm.carrier_code = s.carrier_code
+                  and s.operating_date between ttm.valid_from and ttm.valid_to
+            left join d_train_type ttc
+                   on ttc.category_code = s.category_code and ttc.carrier_code = s.carrier_code
+                  and ttc.valid_to = c_valid_to
+        )
+        select date_id, route_id, train_type_id, station_id, hour_id,
+               sum(is_arrival)                                                        as arrivals_count,
+               sum(case when is_arrival = 1 and eff_delay <= 5 then 1 else 0 end)     as arrivals_on_time,
+               sum(case when is_arrival = 1 and eff_delay >= 6 then 1 else 0 end)     as arrivals_delayed,
+               sum(eff_delay)                                                         as sum_arrival_delay_min,
+               case when sum(is_arrival) = 0 then null
+                    else nvl(sum(case when eff_delay >= 6 then eff_delay end), 0) end as sum_delayed_delay_min,
+               max(eff_delay)                                                         as max_arrival_delay_min,
+               sum(is_cancelled)                                                      as cancelled_count,
+               pkg_tool.f_now_warsaw
+        from resolved
+        where train_type_id is not null
+        group by date_id, route_id, train_type_id, station_id, hour_id;
+
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_stop_daily ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_stop_daily;
+
+
+
+    /**********************************************************************************************************/
+    /***** p_load_f_train_disruption_daily  *****/
+    /**********************************************************************************************************/
+    -- occurrences_count = dotkniete przystanki (wiersze disruption_details)
+    -- runs_count        = kursy z utrudnieniem o danej przyczynie (distinct kurs w wierszu faktu)
+    -- runs_total_count  = kursy z utrudnieniem liczone raz: kurs przypisany do najnizszej cause_id
+    --                     na danej stacji w danym dniu (sumowalne takze miedzy przyczynami)
+    PROCEDURE p_load_f_train_disruption_daily(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from DATE;
+        v_to   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;
+
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        DELETE FROM f_train_disruption_daily
+         WHERE date_id BETWEEN TO_NUMBER(TO_CHAR(v_from,'YYYYMMDD'))
+                           AND TO_NUMBER(TO_CHAR(v_to,  'YYYYMMDD'));
+
+        INSERT INTO f_train_disruption_daily
+            (date_id, route_id, station_id, train_type_id, hour_id, cause_id,
+             occurrences_count, runs_count, runs_total_count, loaded_at)
+        WITH dd AS (          -- dotkniete przystanki w oknie
+            select d.operating_date,
+                   to_number(to_char(d.operating_date,'YYYYMMDD')) as date_id,
+                   d.schedule_id, d.order_id, d.train_order_id,
+                   d.dsta_id as station_id, d.sequence_number, d.dihe_id
+            from disruption_details d
+            where d.operating_date between v_from and v_to
+        ),
+        ep AS (
+            select sd.schedule_id, sd.order_id,
+                   min(sd.order_number) as min_on, max(sd.order_number) as max_on
+            from schedule_details sd
+            where (sd.schedule_id, sd.order_id) in (select schedule_id, order_id from dd)
+            group by sd.schedule_id, sd.order_id
+        ),
+        route_pair AS (
+            select ep.schedule_id, ep.order_id, f.dsta_id as from_station_id, t.dsta_id as to_station_id
+            from ep
+            join schedule_details f on f.schedule_id=ep.schedule_id and f.order_id=ep.order_id and f.order_number=ep.min_on
+            join schedule_details t on t.schedule_id=ep.schedule_id and t.order_id=ep.order_id and t.order_number=ep.max_on
+        ),
+        resolved AS (
+            select x.date_id,
+                   dr.id                    as route_id,
+                   x.station_id,
+                   coalesce(ttm.id, ttc.id) as train_type_id,
+                   to_number(substr(coalesce(sd.arrival_time, sd.departure_time),1,2)) as hour_id,
+                   coalesce(dc_t.id, dc_m.id) as cause_id,
+                   x.schedule_id,
+                   x.order_id
+            from dd x
+            join schedule_header sh
+              on  sh.operating_date = x.operating_date and sh.schedule_id = x.schedule_id
+              and sh.order_id       = x.order_id       and sh.train_order_id = x.train_order_id
+            join disruption_header dh on dh.id = x.dihe_id
+            join schedule_details sd
+              on sd.schedule_id = x.schedule_id and sd.order_id = x.order_id
+             and sd.order_number = x.sequence_number
+            left join route_pair rp on rp.schedule_id = x.schedule_id and rp.order_id = x.order_id
+            join d_route dr on dr.from_station_id = rp.from_station_id and dr.to_station_id = rp.to_station_id
+            left join d_train_type ttm
+                   on ttm.category_code = sh.category_code and ttm.carrier_code = sh.carrier_code
+                  and x.operating_date between ttm.valid_from and ttm.valid_to
+            left join d_train_type ttc
+                   on ttc.category_code = sh.category_code and ttc.carrier_code = sh.carrier_code
+                  and ttc.valid_to = c_valid_to
+            left join d_disruption_cause dc_t on dc_t.cause_code = dh.disruption_type_code
+            left join d_disruption_cause dc_m on dc_m.cause_code = dh.message
+        ),
+        ok AS (               -- tylko wiersze, ktore wchodza do faktu
+            select r.*,
+                   r.schedule_id || '|' || r.order_id as kurs
+            from resolved r
+            where r.train_type_id is not null
+              and r.cause_id      is not null
+              and r.hour_id       is not null
+        ),
+        kursy AS (            -- najnizsza przyczyna kursu na stacji w danym dniu
+            select o.*,
+                   min(o.cause_id) over (partition by o.date_id, o.station_id, o.kurs) as cause_min
+            from ok o
+        )
+        select date_id, route_id, station_id, train_type_id, hour_id, cause_id,
+               count(*)                                                    as occurrences_count,
+               count(distinct kurs)                                        as runs_count,
+               count(distinct case when cause_id = cause_min then kurs end) as runs_total_count,
+               pkg_tool.f_now_warsaw
+        from kursy
+        group by date_id, route_id, station_id, train_type_id, hour_id, cause_id;
+
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_disruption_daily ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_disruption_daily;
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_f_train_dep_daily  *****/
+    /**********************************************************************************************************/
+    -- lustro p_load_f_train_stop_daily dla ODJAZDOW: godzina = planowy odjazd, bez stacji koncowej
+    PROCEDURE p_load_f_train_dep_daily(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from DATE;
+        v_to   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;
+
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        DELETE FROM f_train_dep_daily
+         WHERE date_id BETWEEN TO_NUMBER(TO_CHAR(v_from,'YYYYMMDD'))
+                           AND TO_NUMBER(TO_CHAR(v_to,  'YYYYMMDD'));
+
+        INSERT INTO f_train_dep_daily
+            (date_id, route_id, train_type_id, station_id, hour_id,
+             departures_count, departures_on_time, departures_delayed,
+             sum_departure_delay_min, sum_delayed_delay_min, max_departure_delay_min, cancelled_count, loaded_at)
+        WITH runs AS (            -- kursy w oknie + atrybuty z rozkladu
+            select oh.id as ophe_id,
+                   oh.operating_date,
+                   to_number(to_char(oh.operating_date,'YYYYMMDD')) as date_id,
+                   oh.schedule_id, oh.order_id,
+                   sh.category_code, sh.carrier_code
+            from operation_header oh
+            join schedule_header sh
+              on  sh.operating_date = oh.operating_date and sh.schedule_id = oh.schedule_id
+              and sh.order_id       = oh.order_id       and sh.train_order_id = oh.train_order_id
+            where oh.operating_date between v_from and v_to
+        ),
+        ep AS (
+            select sd.schedule_id, sd.order_id,
+                   min(sd.order_number) as min_on, max(sd.order_number) as max_on
+            from schedule_details sd
+            where (sd.schedule_id, sd.order_id) in (select schedule_id, order_id from runs)
+            group by sd.schedule_id, sd.order_id
+        ),
+        route_pair AS (
+            select ep.schedule_id, ep.order_id, f.dsta_id as from_station_id, t.dsta_id as to_station_id
+            from ep
+            join schedule_details f on f.schedule_id=ep.schedule_id and f.order_id=ep.order_id and f.order_number=ep.min_on
+            join schedule_details t on t.schedule_id=ep.schedule_id and t.order_id=ep.order_id and t.order_number=ep.max_on
+        ),
+        stops AS (                -- przystanki (nie-terminal) z planowa godzina odjazdu
+            select r.date_id, r.schedule_id, r.order_id, r.operating_date,
+                   r.category_code, r.carrier_code,
+                   od.dsta_id                                as station_id,
+                   to_number(substr(sd.departure_time,1,2))  as hour_id,
+                   case when od.is_confirmed and not od.is_cancelled then 1 else 0 end as is_departure,
+                   case when od.is_confirmed and not od.is_cancelled then nvl(od.departure_delay_min,0) end as eff_delay,
+                   case when od.is_cancelled then 1 else 0 end as is_cancelled
+            from runs r
+            join operation_details od on od.ophe_id = r.ophe_id
+            join schedule_details sd
+              on sd.schedule_id = r.schedule_id and sd.order_id = r.order_id
+             and sd.order_number = od.planned_sequence
+            where sd.departure_time is not null            -- pomija terminal (koniec bez odjazdu)
+        ),
+        resolved AS (
+            select s.date_id,
+                   dr.id                    as route_id,
+                   coalesce(ttm.id, ttc.id) as train_type_id,
+                   s.station_id,
+                   s.hour_id,
+                   s.is_departure, s.eff_delay, s.is_cancelled
+            from stops s
+            left join route_pair rp on rp.schedule_id = s.schedule_id and rp.order_id = s.order_id
+            join d_route dr on dr.from_station_id = rp.from_station_id and dr.to_station_id = rp.to_station_id
+            left join d_train_type ttm
+                   on ttm.category_code = s.category_code and ttm.carrier_code = s.carrier_code
+                  and s.operating_date between ttm.valid_from and ttm.valid_to
+            left join d_train_type ttc
+                   on ttc.category_code = s.category_code and ttc.carrier_code = s.carrier_code
+                  and ttc.valid_to = c_valid_to
+        )
+        select date_id, route_id, train_type_id, station_id, hour_id,
+               sum(is_departure)                                                        as departures_count,
+               sum(case when is_departure = 1 and eff_delay <= 5 then 1 else 0 end)     as departures_on_time,
+               sum(case when is_departure = 1 and eff_delay >= 6 then 1 else 0 end)     as departures_delayed,
+               sum(eff_delay)                                                           as sum_departure_delay_min,
+               case when sum(is_departure) = 0 then null
+                    else nvl(sum(case when eff_delay >= 6 then eff_delay end), 0) end   as sum_delayed_delay_min,
+               max(eff_delay)                                                           as max_departure_delay_min,
+               sum(is_cancelled)                                                        as cancelled_count,
+               pkg_tool.f_now_warsaw
+        from resolved
+        where train_type_id is not null
+        group by date_id, route_id, train_type_id, station_id, hour_id;
+
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_dep_daily ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_dep_daily;
+	
+	
+	
+	
+	
+	/**********************************************************************************************************/
+    /***** p_load_f_train_run_monthly  *****/
+    /**********************************************************************************************************/
+	PROCEDURE p_load_f_train_run_monthly(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from        DATE;
+        v_to          DATE;
+        v_month_start DATE;
+        v_month_end   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;
+
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        -- rozszerz okno do PELNYCH miesiecy (recompute calego miesiaca, tez poprzedniego)
+        v_month_start := TRUNC(v_from, 'MM');
+        v_month_end   := LAST_DAY(v_to);
+
+        -- usun dotkniete miesiace (przeliczamy je od nowa w calosci)
+        DELETE FROM f_train_run_monthly
+         WHERE month IN (
+                   select distinct dd.year*100 + dd.month
+                   from d_date dd
+                   where dd.full_date between v_month_start and v_month_end
+               );
+
+        INSERT INTO f_train_run_monthly
+            (month, route_id, train_type_id, status_id, day_type,
+             runs_count, delayed_count, sum_terminal_delay_min, sum_delayed_delay_min, max_terminal_delay_min,
+             travel_runs_count, sum_planned_travel_min, sum_actual_travel_min, min_actual_travel_min, max_actual_travel_min,
+             loaded_at)
+        SELECT dd.year*100 + dd.month                                   as month,
+               f.route_id, f.train_type_id, f.status_id,
+               case when dd.is_weekend = 'T' then 'WE' else 'WD' end     as day_type,
+               sum(f.runs_count),
+               sum(f.delayed_count),
+               sum(f.sum_terminal_delay_min),
+               sum(f.sum_delayed_delay_min),
+               max(f.max_terminal_delay_min),
+               sum(f.travel_runs_count),                                  -- SUM
+               sum(f.sum_planned_travel_min),                             -- SUM
+               sum(f.sum_actual_travel_min),                              -- SUM
+               min(f.min_actual_travel_min),                              -- MIN
+               max(f.max_actual_travel_min),                              -- MAX
+               pkg_tool.f_now_warsaw
+        from f_train_run_daily f
+        join d_date dd on dd.id = f.date_id
+        where dd.full_date between v_month_start and v_month_end
+        group by dd.year*100 + dd.month,
+                 f.route_id, f.train_type_id, f.status_id,
+                 case when dd.is_weekend = 'T' then 'WE' else 'WD' end;
+
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_run_monthly ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_run_monthly;
+    
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_f_train_stop_monthly  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_f_train_stop_monthly(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from        DATE;
+        v_to          DATE;
+        v_month_start DATE;
+        v_month_end   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        v_month_start := TRUNC(v_from, 'MM');
+        v_month_end   := LAST_DAY(v_to);
+
+        DELETE FROM f_train_stop_monthly
+         WHERE month IN (
+                   select distinct dd.year*100 + dd.month
+                   from d_date dd
+                   where dd.full_date between v_month_start and v_month_end
+               );
+
+        INSERT INTO f_train_stop_monthly
+            (month, route_id, train_type_id, station_id, hour_id, day_type,
+             arrivals_count, arrivals_on_time, arrivals_delayed,
+             sum_arrival_delay_min, sum_delayed_delay_min, max_arrival_delay_min, cancelled_count, loaded_at)
+        SELECT dd.year*100 + dd.month                               as month,
+               f.route_id, f.train_type_id, f.station_id, f.hour_id,
+               case when dd.is_weekend = 'T' then 'WE' else 'WD' end as day_type,
+               sum(f.arrivals_count),
+               sum(f.arrivals_on_time),
+               sum(f.arrivals_delayed),
+               sum(f.sum_arrival_delay_min),
+               sum(f.sum_delayed_delay_min),
+               max(f.max_arrival_delay_min),
+               sum(f.cancelled_count),
+               pkg_tool.f_now_warsaw
+        from f_train_stop_daily f
+        join d_date dd on dd.id = f.date_id
+        where dd.full_date between v_month_start and v_month_end
+        group by dd.year*100 + dd.month,
+                 f.route_id, f.train_type_id, f.station_id, f.hour_id,
+                 case when dd.is_weekend = 'T' then 'WE' else 'WD' end;
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_stop_monthly ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_stop_monthly;
+	
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_f_train_disruption_monthly  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_f_train_disruption_monthly(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from        DATE;
+        v_to          DATE;
+        v_month_start DATE;
+        v_month_end   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        v_month_start := TRUNC(v_from, 'MM');
+        v_month_end   := LAST_DAY(v_to);
+
+        DELETE FROM f_train_disruption_monthly
+         WHERE month IN (
+                   select distinct dd.year*100 + dd.month
+                   from d_date dd
+                   where dd.full_date between v_month_start and v_month_end
+               );
+
+        INSERT INTO f_train_disruption_monthly
+            (month, route_id, station_id, train_type_id, hour_id, cause_id, day_type,
+             occurrences_count, runs_count, runs_total_count, loaded_at)
+        SELECT dd.year*100 + dd.month                               as month,
+               f.route_id, f.station_id, f.train_type_id, f.hour_id, f.cause_id,
+               case when dd.is_weekend = 'T' then 'WE' else 'WD' end as day_type,
+               sum(f.occurrences_count),
+               sum(f.runs_count),
+               sum(f.runs_total_count),
+               pkg_tool.f_now_warsaw
+        from f_train_disruption_daily f
+        join d_date dd on dd.id = f.date_id
+        where dd.full_date between v_month_start and v_month_end
+        group by dd.year*100 + dd.month,
+                 f.route_id, f.station_id, f.train_type_id, f.hour_id, f.cause_id,
+                 case when dd.is_weekend = 'T' then 'WE' else 'WD' end;
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_disruption_monthly ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_disruption_monthly;
+    
+    
+    
+    /**********************************************************************************************************/
+    /***** p_load_f_train_dep_monthly  *****/
+    /**********************************************************************************************************/
+    PROCEDURE p_load_f_train_dep_monthly(p_days IN NUMBER DEFAULT c_default_days) IS
+        v_from        DATE;
+        v_to          DATE;
+        v_month_start DATE;
+        v_month_end   DATE;
+    BEGIN
+        EXECUTE IMMEDIATE c_parallel_dml;
+        v_from := TRUNC(SYSDATE) - p_days;
+        v_to   := TRUNC(SYSDATE) - 1;
+        v_month_start := TRUNC(v_from, 'MM');
+        v_month_end   := LAST_DAY(v_to);
+
+        DELETE FROM f_train_dep_monthly
+         WHERE month IN (
+                   select distinct dd.year*100 + dd.month
+                   from d_date dd
+                   where dd.full_date between v_month_start and v_month_end
+               );
+
+        INSERT INTO f_train_dep_monthly
+            (month, route_id, train_type_id, station_id, hour_id, day_type,
+             departures_count, departures_on_time, departures_delayed,
+             sum_departure_delay_min, sum_delayed_delay_min, max_departure_delay_min, cancelled_count, loaded_at)
+        SELECT dd.year*100 + dd.month                               as month,
+               f.route_id, f.train_type_id, f.station_id, f.hour_id,
+               case when dd.is_weekend = 'T' then 'WE' else 'WD' end as day_type,
+               sum(f.departures_count),
+               sum(f.departures_on_time),
+               sum(f.departures_delayed),
+               sum(f.sum_departure_delay_min),
+               sum(f.sum_delayed_delay_min),
+               max(f.max_departure_delay_min),
+               sum(f.cancelled_count),
+               pkg_tool.f_now_warsaw
+        from f_train_dep_daily f
+        join d_date dd on dd.id = f.date_id
+        where dd.full_date between v_month_start and v_month_end
+        group by dd.year*100 + dd.month,
+                 f.route_id, f.train_type_id, f.station_id, f.hour_id,
+                 case when dd.is_weekend = 'T' then 'WE' else 'WD' end;
+        p_log_rows(SQL%ROWCOUNT);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('load_f_train_dep_monthly ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_f_train_dep_monthly;
+	
+	-- ================= FAKTY =================
+	
+	
+    
+    
+    
+
+    -- ================= ORCHESTRACJA =================
+
+    PROCEDURE p_load_dimensions (p_full_load IN BOOLEAN DEFAULT c_full_load) IS
+    BEGIN
+        DBMS_OUTPUT.PUT_LINE('=== GOLD dimensions load START ===');
+        EXECUTE IMMEDIATE c_parallel_dml;
+
+        p_load_d_date;
+        p_load_d_hour;
+        p_load_d_station;
+        p_load_d_route(p_full_load);
+        p_load_d_train_type;
+        p_load_d_train_status;
+        p_load_d_disruption_cause;
+
+        COMMIT;
+        DBMS_OUTPUT.PUT_LINE('=== GOLD dimensions load OK (COMMIT) ===');
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('=== GOLD dimensions load ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_dimensions;
+    
+    
+    
+    PROCEDURE p_load_facts_daily (p_days IN NUMBER DEFAULT c_default_days) IS
+    BEGIN
+        DBMS_OUTPUT.PUT_LINE('=== GOLD facts daily load START ===');
+        EXECUTE IMMEDIATE c_parallel_dml;
+
+        p_load_f_train_run_daily(p_days);
+        p_load_f_train_stop_daily(p_days);
+        p_load_f_train_disruption_daily(p_days);
+        p_load_f_train_dep_daily(p_days);
+
+        COMMIT;
+        DBMS_OUTPUT.PUT_LINE('=== GOLD facts daily load OK (COMMIT) ===');
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('=== GOLD facts daily load ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_facts_daily;
+	
+	
+	
+	PROCEDURE p_load_facts_monthly (p_days IN NUMBER DEFAULT c_default_days) IS
+	
+		v_type VARCHAR(20 CHAR) := 'facts monthly';
+	
+    BEGIN
+        DBMS_OUTPUT.PUT_LINE('=== GOLD ' || v_type || ' load START ===');
+        EXECUTE IMMEDIATE c_parallel_dml;
+
+        p_load_f_train_run_monthly(p_days);
+        p_load_f_train_stop_monthly(p_days);
+        p_load_f_train_disruption_monthly(p_days);
+        p_load_f_train_dep_monthly(p_days);
+
+        COMMIT;
+        DBMS_OUTPUT.PUT_LINE('=== GOLD ' || v_type || ' load OK (COMMIT) ===');
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('=== GOLD ' || v_type || ' load ERROR - ROLLBACK: ' || SQLERRM);
+            RAISE;
+    END p_load_facts_monthly;
+	
+	
+	
+	-- ================= ORCHESTRACJA =================
+
+END pkg_gold_load;
+/
+
+
+grant execute on gold.pkg_gold_load to DEV_APP;

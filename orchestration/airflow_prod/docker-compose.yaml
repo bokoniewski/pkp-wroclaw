@@ -1,0 +1,123 @@
+# Airflow PKP — sterowanie DEV/PROD przez --env-file + -p
+# DEV:  docker compose --env-file .env.docker.dev  -p pkp-airflow-daily-dev  up -d
+# PROD: docker compose --env-file .env.docker.prod -p pkp-airflow-daily-prod up -d
+# init RAZ na środowisko:  <to samo> up airflow-init
+
+x-airflow-common: &airflow-common
+  build:
+    context: ../..
+    dockerfile: orchestration/airflow_prod/Dockerfile
+  environment: &airflow-env
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Europe/Warsaw
+    AIRFLOW__LOGGING__DELETE_LOCAL_LOGS: 'true'
+    AIRFLOW__LOGGING__MAX_LOG_AGE_IN_DAYS: '30'
+    TZ: Europe/Warsaw
+    PYTHONPATH: /opt/airflow/repo/ingestion:/opt/airflow/repo/load:/opt/airflow/repo/orchestration/airflow_prod/plugins
+    # --- PKP: instancja sterowana env-file ---
+    PKP_ENV: ${PKP_ENV}
+    PKP_API_KEY: ${PKP_API_KEY}
+    PKP_DATA_ROOT: /opt/airflow/repo/Data
+    PKP_WALLET_DIR: /wallet
+    PKP_WALLET_PASSWORD: ${PKP_WALLET_PASSWORD}
+    PKP_DB_USER: ${PKP_DB_USER}
+    PKP_DB_PASSWORD: ${PKP_DB_PASSWORD}
+    PKP_DB_DSN: ${PKP_DB_DSN}
+    PKP_OCI_PROFILE: ${PKP_OCI_PROFILE:-DEFAULT}
+    PKP_OCI_CONFIG_FILE: /oci/config.docker
+    PKP_OCI_BUCKET: ${PKP_OCI_BUCKET}
+    PKP_OCI_BUCKET_LIVE: ${PKP_OCI_BUCKET_LIVE}
+    # --- mail (raport) ---
+    SMTP_HOST: ${SMTP_HOST}
+    SMTP_PORT: ${SMTP_PORT}
+    SMTP_USER: ${SMTP_USER}
+    SMTP_PASSWORD: ${SMTP_PASSWORD}
+    SENDER_EMAIL: ${SENDER_EMAIL}
+    SENDER_NAME: ${SENDER_NAME}
+    REPORT_EMAIL: ${REPORT_EMAIL}
+    # --- keepalive DEV ---
+    KEEPALIVE_DEV_DSN: ${KEEPALIVE_DEV_DSN}
+    KEEPALIVE_DEV_USER: ${KEEPALIVE_DEV_USER}
+    KEEPALIVE_DEV_PASSWORD: ${KEEPALIVE_DEV_PASSWORD}
+    KEEPALIVE_DEV_WALLET_DIR: ${KEEPALIVE_DEV_WALLET_DIR}
+    KEEPALIVE_DEV_WALLET_PASSWORD: ${KEEPALIVE_DEV_WALLET_PASSWORD}
+  volumes:
+    - ../..:/opt/airflow/repo
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ${PKP_WALLET_HOST_DIR}:/wallet:ro
+    - ${PKP_WALLET_DEV_HOST_DIR}:/wallet_dev:ro
+    - ${PKP_OCI_CONFIG_HOST_DIR}:/oci:ro
+  logging: &default-logging
+    driver: "json-file"
+    options: { max-size: "20m", max-file: "3" }
+
+services:
+
+  postgres-airflow:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - postgres-airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER}"]
+      interval: 10s
+      retries: 5
+    restart: unless-stopped
+    logging: *default-logging
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username ${AIRFLOW_ADMIN_USERNAME} \
+          --firstname Admin --lastname User --role Admin \
+          --email ${AIRFLOW_ADMIN_EMAIL} --password ${AIRFLOW_ADMIN_PASSWORD}
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "${AIRFLOW_PORT:-8081}:8080"
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --local || exit 1"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  postgres-airflow-data:

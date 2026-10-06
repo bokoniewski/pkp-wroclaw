@@ -1,0 +1,65 @@
+# ──────────────────────────────────────────────────────────────────────────
+# CI — brama jakości. Uruchamiana automatycznie na push / pull_request.
+# Trzy niezależne joby:
+#   test            - pip-audit, ruff (lint), pytest
+#   gitleaks        - skan sekretów w historii repo
+#   flyway-validate - walidacja migracji (5 projektow) na PKPDEV, read-only
+# Runner GitHub-hosted (ubuntu) - efemeryczny, więc wallet z sekretu base64.
+# Nic nie wdraża ani nie zmienia w bazie; samo wdrożenie robi cd.yml.
+# ──────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ingestion
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ./ pytest ruff pip-audit
+      - run: pip-audit || true
+      - run: ruff check .
+      - run: pytest
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+  
+  flyway-validate:
+    runs-on: ubuntu-latest
+    env:
+      FLYWAY_URL: "${{ vars.PKP_FLYWAY_URL_UBUNTU_DEV }}"
+      FLYWAY_USER: ${{ vars.PKP_FLYWAY_USER_DEVELOPER }}
+      FLYWAY_PASSWORD: ${{ secrets.PKP_DB_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Odtworz wallet z sekretu
+        run: |
+          echo "${{ secrets.PKP_WALLET_PKPDEV_ZIP_B64 }}" | base64 -d > wallet.zip
+          mkdir wallet && unzip -q wallet.zip -d wallet
+
+      - name: Flyway validate (5 projektow)
+        run: |
+          for p in admin stg maintenance silver gold; do
+            echo "=== validate: $p ==="
+            docker run --rm -v ${{ github.workspace }}:/repo redgate/flyway:11 \
+              -configFiles=/repo/migrations/$p/conf/flyway.conf \
+              -locations=filesystem:/repo/migrations/$p/sql \
+              -url="$FLYWAY_URL" -user="$FLYWAY_USER" -password="$FLYWAY_PASSWORD" \
+              -ignoreMigrationPatterns="*:pending" \
+              validate
+          done

@@ -1,0 +1,112 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv*/
+env/
+ENV/
+Database/
+test_api/
+*.egg-info/
+build/
+dist/
+
+
+
+# API Keys & Secrets
+.env
+!.env.example
+*.key
+config_local.py
+.env.docker.dev
+.env.docker.prod
+.env.dev
+.env.prod
+!.env.dev.example
+!.env.prod.example
+!.env.docker.dev.example
+!.env.docker.prod.example
+
+
+
+
+
+
+
+
+# Data files
+*.csv
+*.xlsx
+output/
+logs/
+png/*/*
+
+# Data files — ignoruj zawartość ale zachowaj strukturę folderów
+data/**
+!data/**/
+!data/**/.gitkeep
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Loging
+*.log
+
+
+# dbt
+target/
+dbt_packages/
+logs/
+.user.yml
+
+
+# Airflow prod
+airflow_prod/.env
+airflow_prod/logs/
+
+
+# ── Ogólne klucze i sekrety ───────────────────────────
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.sso
+secrets.*
+credentials*
+config_local.py
+
+
+# ── OCI CLI / klucze API ──────────────────────────────
+.oci/
+*_api_key.pem
+oci_api_key*.pem
+
+
+# ── Wallet Oracle ADB (cała zawartość zipa z konsoli) ─
+cwallet.sso
+ewallet.p12
+ewallet.pem
+keystore.jks
+truststore.jks
+tnsnames.ora
+sqlnet.ora
+ojdbc.properties           
+
+
+# ── OCI: pokaż folder + README + pustą strukturę, ukryj sekrety ──
+OCI/**
+!OCI/**/
+!OCI/README.md
+!OCI/**/.gitkeep
+Wallet_*.zip
+

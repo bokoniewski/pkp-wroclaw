@@ -1,0 +1,66 @@
+name: pkp-poller-live
+
+services:
+  poller-dev:
+    image: pkp-poller:latest
+    container_name: pkp-poller-dev-live
+    restart: unless-stopped
+
+    # ── Rotacja logów: kontener nie zapcha dysku ──────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"      # jeden plik logów max 20 MB
+        max-file: "2"        # max 2 pliki → twardy limit 40 MB
+
+    env_file:
+      - .env.docker.dev
+
+    # ── Bezpiecznik pamięci: poller nie zje całego RAM-u ──────────
+    mem_limit: 512m
+    cpus: 0.5
+
+    # ── Healthcheck: żywy = świeży heartbeat_last.json ────────────
+    healthcheck:
+      test: ["CMD-SHELL", "find /app/ingestion/Data/$PKP_ENV/STATE/LIVE/heartbeat_last.json -mmin -10 | grep -q . || exit 1"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 3m
+
+    volumes:
+      - ${PKP_DATA_HOST_DIR}:/app/ingestion/Data
+      - ${PKP_WALLET_HOST_DIR}:/wallet:ro
+      - ${PKP_OCI_CONFIG_HOST_DIR}:/oci:ro
+
+  poller-prod:
+    image: pkp-poller:latest
+    container_name: pkp-poller-prod-live
+    restart: unless-stopped
+
+    # ── Rotacja logów: kontener nie zapcha dysku ──────────────────
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"      # jeden plik logów max 20 MB
+        max-file: "2"        # max 2 pliki → twardy limit 40 MB
+
+    env_file:
+      - .env.docker.prod
+
+    # ── Bezpiecznik pamięci: poller nie zje całego RAM-u ──────────
+    mem_limit: 512m
+    cpus: 0.5
+
+    # ── Healthcheck: żywy = świeży heartbeat_last.json ────────────
+    healthcheck:
+      test: ["CMD-SHELL", "find /app/ingestion/Data/$PKP_ENV/STATE/LIVE/heartbeat_last.json -mmin -10 | grep -q . || exit 1"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 3m
+
+    volumes:
+      - ${PKP_DATA_HOST_DIR}:/app/ingestion/Data
+      - ${PKP_WALLET_HOST_DIR}:/wallet:ro
+      - ${PKP_OCI_CONFIG_HOST_DIR}:/oci:ro

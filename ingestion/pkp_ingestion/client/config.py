@@ -1,0 +1,135 @@
+"""
+config.py
+---------
+Statyczna konfiguracja polaczenia z PKP PLK API:
+- base_url,
+- mapa endpointow slownikow (DICT),
+- domyslny timeout.
+"""
+
+BASE_URL = "https://pdp-api.plk-sa.pl"
+
+# Domyslny timeout requestu (sekundy).
+DEFAULT_TIMEOUT = 10
+
+# --- Retry / backoff ---
+# Ponawiamy tylko bledy przejsciowe: 429 (rate limit) + 5xx oraz bledy sieciowe.
+# Bledy 4xx (poza 429) NIE sa ponawiane - nie naprawia sie samo.
+RETRY_MAX_ATTEMPTS = 4              # laczna liczba prob (1 pierwsza + 3 ponowienia)
+RETRY_BACKOFF_BASE = 1.0           # sekundy; opoznienie = base * 2**(proba-1) -> 1,2,4
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# --- Endpointy administracyjne klucza API (limity / zuzycie) ---
+APIKEY_ENDPOINTS = {
+    "usage": "/api/v1/apikey/usage",   # biezace zuzycie z limitu
+    "info":  "/api/v1/apikey/info",    # info o kluczu (tier, limity)
+}
+
+# Slowniki DEF majace bezposredni endpoint (GET).
+# Klucz  = krotka nazwa uzywana w nazwie pliku (dict_<nazwa>_<ts>.json),
+# wartosc = {"endpoint": sciezka, "params": staly slownik parametrow query lub None}.
+# Ujednolicony ksztalt: kazdy endpoint deklaratywnie niesie swoje parametry.
+DICTIONARY_ENDPOINTS = {
+    "carriers":              {"endpoint": "/api/v1/dictionaries/carriers",              "params": None},
+    "cities":                {"endpoint": "/api/v1/dictionaries/cities",                "params": None},
+    # stations: default zwraca 500; pageSize=10000 (max) -> wszystkie stacje.
+    "stations":              {"endpoint": "/api/v1/dictionaries/stations",              "params": {"pageSize": 10000}},
+    "commercial_categories": {"endpoint": "/api/v1/dictionaries/commercial-categories", "params": None},
+    "stop_types":            {"endpoint": "/api/v1/dictionaries/stop-types",            "params": None},
+}
+
+# Slowniki bez wlasnego endpointu - wyciagane "przy okazji" innego zapytania.
+# disruption_types: endpoint disruptions z filtrem dajacym PUSTA liste utrudnien
+#                   (carriersInclude=BRAK -> nieistniejacy przewoznik) + slownikiem.
+# train_statuses:   slownik opisu pol endpointu operations (/api/v1/fields/operations).
+SPECIAL_DICTIONARIES = {
+    "disruption_types": {
+        "endpoint": "/api/v1/disruptions",
+        "params": {"carriersInclude": "BRAK", "dictionaries": "true"},
+    },
+    "train_statuses": {
+        "endpoint": "/api/v1/fields/operations",
+        "params": None,
+    },
+}
+
+# --- Dane dzienne (DAILY DATA) ---
+
+# "default_day": kotwica zakresu = dateTo:  "D" -> dzis, "D-1" -> wczoraj, None -> brak daty
+# "range_days":  dlugosc okna wstecz od kotwicy (dni). Brak => 1 (pojedynczy dzien).
+#                dateTo = kotwica, dateFrom = kotwica - (range_days - 1).
+DATE_TOKEN = "{day}"
+
+STATION_TOKEN = "{station}"
+
+DATA_ENDPOINTS = {
+    "schedules": {
+        "endpoint":  "/api/v1/schedules",
+        "params": {
+            "stations":     STATION_TOKEN,
+            "fullRoute":    "true",
+            "dictionaries": "false",
+            "dateFrom":     DATE_TOKEN,
+            "dateTo":       DATE_TOKEN,
+        },
+        "default_day": "D+7",       # kotwica = dateTo
+        "range_days":  10,
+        "paginated":   False,
+    },
+    "operations": {
+        "endpoint":  "/api/v1/operations",
+        "params": {
+            "stations":    STATION_TOKEN,
+            "fullRoutes":  "true",     # pelne trasy pociagow przez stacje
+            "withPlanned": "true",     # planowe czasy + policzone opoznienia
+            "pageSize":    5000,       # max -> mniej stron/calli
+            # page wstrzykiwany w petli (runtime) - to mechanika paginacji, nie parametr uzytkownika
+        },
+        "default_day": None,         # bez daty - operations to snapshot "na teraz", nie zakres dobowy
+        "paginated": True,             # operations paginowany: petla po stronach
+    },
+    "disruptions": {
+        "endpoint":  "/api/v1/disruptions",
+        "params": {
+            "dictionaries": "false",
+            "dateFrom":     DATE_TOKEN,
+            "dateTo":       DATE_TOKEN,
+        },
+        "default_day": "D-1",    # kotwica = dateTo (nocny run -> wczoraj)
+        "range_days":  3,        # 1 = pojedynczy dzien; 3 = ostatnie 3 dni (D-3..D-1)
+        "paginated":   False,
+    },
+}
+
+# Wielkosc strony operations (spojna z params powyzej; uzywana w petli).
+OPERATIONS_PAGE_SIZE = 5000
+
+
+# --- Dane LIVE (micro batch) ---
+# Rozne parametry niz daily: operations flaga szczegolow OFF (tylko wlasna stacja),
+# disruptions okno 2 dni z filtrem stacji. Kotwica = dzis (live patrzy "na teraz").
+DATA_ENDPOINTS_LIVE = {
+    "operations": {
+        "endpoint":  "/api/v1/operations",
+        "params": {
+            "stations":    STATION_TOKEN,
+            "fullRoutes":  "false",    # OFF -> stations[] tylko wlasna stacja
+            "withPlanned": "true",     # planowe czasy -> opoznienia liczone z live
+            "pageSize":    5000,
+        },
+        "default_day": None,         # operations bez dat (snapshot ostatnich ~5 dni)
+        "paginated":   True,
+    },
+    "disruptions": {
+        "endpoint":  "/api/v1/disruptions",
+        "params": {
+            "stations":     STATION_TOKEN,   # filtr po stacji (API to przyjmuje)
+            "dictionaries": "false",
+            "dateFrom":     DATE_TOKEN,
+            "dateTo":       DATE_TOKEN,
+        },
+        "default_day": "D",     # kotwica = dzis
+        "range_days":  2,       # okno 2 dni (D-1..D) - laternia na przelom polnocy
+        "paginated":   False,
+    },
+}
