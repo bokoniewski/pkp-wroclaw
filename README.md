@@ -31,7 +31,7 @@
 
 Projekt implementuje architekturę Medallion na Oracle Autonomous Database. Surowe odpowiedzi API trafiają jako pliki JSON do Object Storage (Bronze), stamtąd do tabel landing w schemacie `stg`. Warstwa Silver rozbija JSON na model relacyjny, a Gold buduje na nim Star Schema z faktami dziennymi i miesięcznymi. Wyniki prezentuje aplikacja w Oracle APEX: tablica odjazdów i przyjazdów na żywo, rozkład jazdy i statystyki punktualności.
 
-**Aplikacja dostępna na żywo:** [**PKP Wrocław Główny — tablica i statystyki**](https://example.com)
+**Aplikacja dostępna na żywo:** [**PKP Wrocław Główny — tablica i statystyki**](https://pkpwroclaw.share.zrok.io)
 
 Główne założenia:
 
