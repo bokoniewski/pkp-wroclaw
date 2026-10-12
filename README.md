@@ -2,7 +2,7 @@
 
 ### Pipeline danych pobierający z API PKP PLK ruch pociągów na stacji Wrocław Główny — w trybie dziennym (batch) i na żywo (micro-batch co ok. 3 minuty) — i dostarczający przez architekturę Medallion w Oracle Autonomous Database statystyki punktualności gotowe do analizy BI.
 
-**Autor:** Bartłomiej Okoniewski · [github.com/bokoniewski](https://github.com/bokoniewski)
+**Autor:** Bartłomiej Okoniewski · [www.bokoniewski.pl](https://bokoniewski.pl)
 
 ---
 
