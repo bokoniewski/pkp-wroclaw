@@ -74,13 +74,17 @@ Dane operacyjne są ładowane jako insert-only-new (`INSERT … WHERE NOT EXISTS
 
 ### Gold (krok 6)
 
-Trzy wywołania, każde z własnym `COMMIT`:
+Task `gold_load` wywołuje trzy procedury pakietu `gold.pkg_gold_load`, po kolei:
 
-1. `p_load_dimensions` — wymiary: generowane (`d_date`, `d_hour`) przez idempotentny `INSERT`, pozostałe przez `MERGE`; `d_train_type` w modelu SCD2.
-2. `p_load_facts_daily(gold_days_back)` — fakty dzienne dla okna ostatnich dni: `DELETE` okna + `INSERT`.
-3. `p_load_facts_monthly(gold_days_back)` — roll-up miesięcy, których dotyczy okno.
+1. `p_load_dimensions` — wymiary: generowane (`d_date`, `d_hour`) przez idempotentny `INSERT`, pozostałe przez `MERGE`; `d_train_type` w modelu SCD2. Wszystkie wymiary zamyka jeden `COMMIT`.
+2. `p_load_facts_daily(gold_days_back)` — cztery fakty dzienne (`f_train_run_daily`, `f_train_stop_daily`, `f_train_disruption_daily`, `f_train_dep_daily`) dla okna ostatnich dni: `DELETE` okna + `INSERT`.
+3. `p_load_facts_monthly(gold_days_back)` — cztery fakty miesięczne przeliczane z dziennych, dla pełnych miesięcy, których dotyka okno: `DELETE` miesięcy + `INSERT`.
 
 Parametr DAG-a `gold_days_back` (domyślnie 3) ustala szerokość okna.
+
+**Transakcje:** każda tabela faktów ładuje się w osobnej transakcji (`DELETE` + `INSERT` + `COMMIT`). Błąd jednego faktu cofa tylko ten fakt (`ROLLBACK`) i przerywa krok — fakty załadowane wcześniej zostają zatwierdzone, kolejne nie są ładowane.
+
+**Dlaczego osobno, a nie jedna transakcja:** zasada w projekcie — jedna transakcja tylko tam, gdzie dane muszą być spójne „wszystko albo nic” (Silver: nagłówki i szczegóły). Fakty Gold są od siebie niezależne, więc każdy ma własną, krótszą transakcję, co mniej obciąża instancję Always Free. Częściowo załadowany Gold nie wymaga naprawy ręcznej: kolejne uruchomienie kasuje to samo okno i liczy je od nowa.
 
 **Dlaczego okno, a nie tylko wczoraj:** dane o wykonaniu kursów i utrudnieniach potrafią uzupełniać się z opóźnieniem. Przeliczenie kilku ostatnich dni koryguje fakty bez osobnego mechanizmu poprawek, a `DELETE` + `INSERT` czyni krok idempotentnym.
 
@@ -203,6 +207,30 @@ Po każdym cyklu, dla każdego feedu, poller zapisuje wiersz do `maintenance.pol
 Wpis trafia najpierw do lokalnego pliku `heartbeat_spool.jsonl`, a potem cały spool jest wgrywany do bazy w jednej transakcji. Klucz główny `(run_ts, feed)` chroni przed duplikatami.
 
 **Dlaczego spool:** heartbeat ma dokumentować także te cykle, w których baza była niedostępna. Zapis bezpośrednio do bazy zgubiłby dokładnie te wpisy, które są najciekawsze.
+
+
+
+### Kontener i odporność serwisu
+
+Poller działa jako kontener Docker (`ingestion/docker-compose.yml`) z zabezpieczeniami, żeby długo działający serwis nie zaszkodził maszynie ani sam sobie:
+
+| Mechanizm | Ustawienie | Po co |
+|---|---|---|
+| Restart | `restart: unless-stopped` | kontener wstaje sam po błędzie i po restarcie Dockera |
+| Limit zasobów | `mem_limit: 512m`, `cpus: 0.5` | poller nie zajmie całej pamięci i procesora maszyny |
+| Rotacja logów | 2 pliki po 20 MB | logi nie zapchają dysku (twardy limit 40 MB) |
+| Healthcheck | `heartbeat_last.json` młodszy niż 10 min | kontener „żyje” tylko wtedy, gdy cykle faktycznie się kończą, a nie gdy proces po prostu istnieje |
+| Konfiguracja | wallet, klucze OCI i `.env` montowane przy starcie | obraz zawiera wyłącznie kod, bez sekretów |
+
+### Zamrażanie zakończonych kursów
+
+Kurs, który na stacji ma już stan końcowy (odjazd potwierdzony albo odwołanie), jest „zamrożony”: kolejne zmiany w API nie trafiają już do delty. Dzięki temu późne korekty po odjeździe nie zaśmiecają logu śledzenia i nie zmieniają historii tablicy.
+
+### Komunikacja z API i bucketem
+
+- **API:** błędy przejściowe (429, 5xx, zerwane połączenie) są ponawiane z rosnącym odstępem; przy 429/503 klient czeka tyle, ile wskaże API w nagłówku `Retry-After`. Błędy 4xx (poza 429) nie są ponawiane.
+- **Bucket:** każdy plik wysyłany z sumą MD5, którą sprawdza serwer, a potem ponownie klient po odpowiedzi; błędy przejściowe ponawiane przez SDK OCI.
+
 
 ---
 
