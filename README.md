@@ -2,7 +2,7 @@
 
 ### Pipeline danych pobierający z API PKP PLK ruch pociągów na stacji Wrocław Główny — w trybie dziennym (batch) i na żywo (micro-batch co ok. 3 minuty) — i dostarczający przez architekturę Medallion w Oracle Autonomous Database statystyki punktualności gotowe do analizy BI.
 
-**Autor:** Bartłomiej Okoniewski · [www.bokoniewski.pl](https://bokoniewski.pl)
+**Autor:** Bartłomiej Okoniewski · [github.com/bokoniewski](https://github.com/bokoniewski)
 
 ---
 
@@ -31,7 +31,7 @@
 
 Projekt implementuje architekturę Medallion na Oracle Autonomous Database. Surowe odpowiedzi API trafiają jako pliki JSON do Object Storage (Bronze), stamtąd do tabel landing w schemacie `stg`. Warstwa Silver rozbija JSON na model relacyjny, a Gold buduje na nim Star Schema z faktami dziennymi i miesięcznymi. Wyniki prezentuje aplikacja w Oracle APEX: tablica odjazdów i przyjazdów na żywo, rozkład jazdy i statystyki punktualności.
 
-**Aplikacja dostępna na żywo:** [**PKP Wrocław Główny — tablica i statystyki**](https://pkpwroclaw.share.zrok.io)
+**Aplikacja dostępna na żywo:** [**PKP Wrocław Główny — tablica i statystyki**](https://example.com)
 
 Główne założenia:
 
@@ -65,7 +65,12 @@ Główne założenia:
 
 **Audyt i monitoring** — każdy task DAG-a i każdy cykl pollera zostawia wiersz w schemacie `maintenance`. Z tych tabel powstaje codzienny raport utrzymaniowy (Excel + PDF).
 
-**Wdrożenia** — CI na każdy push: testy, lint, skan sekretów i walidacja migracji Flyway na instancji DEV. CD uruchamiane ręcznie: migracja DEV, potem PROD za bramką akceptacji. Obraz Docker zawiera wyłącznie kod; konfiguracja, wallet i sekrety są montowane przy starcie.
+**Wdrożenia** — dwa osobne przepływy w GitHub Actions:
+
+- **CI** — automatycznie na każdy push, na maszynach GitHuba: testy (`pytest`), lint (`ruff`), audyt zależności (`pip-audit`), skan sekretów w historii repo (`gitleaks`) i walidacja migracji Flyway na instancji DEV (tylko odczyt, bez zmian w bazie).
+- **CD** — uruchamiane ręcznie, wykonywane na własnym runnerze (self-hosted) na serwerze domowym, który łączy się z Oracle Autonomous Database: migracja DEV, potem PROD za bramką akceptacji. Wallet połączeniowy nie opuszcza tej maszyny — w GitHubie są tylko hasła (Secrets) i ścieżki (Variables).
+
+Środowisko uruchomieniowe: Airflow, poller live i cała logika w Pythonie działają w kontenerach Docker na serwerze domowym; dane, transformacje (PL/SQL) i aplikacja APEX — w Oracle Cloud. Obraz Docker zawiera wyłącznie kod; konfiguracja, wallet i sekrety są montowane przy starcie.
 
 Szczegółowy opis kroków, obsługi błędów i audytu: [docs/pipeline_flow.md](docs/pipeline_flow.md)
 
