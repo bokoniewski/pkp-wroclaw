@@ -269,3 +269,17 @@ data/<ENV>/
 | Gold, fakty | `DELETE` okna + `INSERT` |
 
 Każdy krok można uruchomić ponownie na tych samych danych bez duplikatów i bez ręcznego sprzątania.
+
+### Działanie po przerwie
+
+Pipeline działa na serwerze domowym, więc musi bezpiecznie wrócić po wyłączeniu maszyny, restarcie albo braku internetu.
+
+| Element | Co się dzieje po powrocie | Co jest tracone |
+|---|---|---|
+| Kontenery | wstają same po starcie Dockera (`restart: unless-stopped`) | — |
+| DAG `pkp_daily` | Airflow uruchamia jeden zaległy przebieg (najnowszy); `catchup=False`, więc nie nadrabia wszystkich pominiętych dni | dni starsze niż ostatni — do uruchomienia ręcznie |
+| Poller live | pobiera aktualny snapshot i porównuje go z `STATE` sprzed przerwy, więc wysyła jedną zbiorczą deltę | historia pośrednich zmian z czasu przerwy (np. kolejne wartości opóźnienia) |
+| Gold | okno `gold_days_back` przelicza ostatnie dni, więc braki z przerwy krótszej niż okno uzupełniają się same | — |
+
+Statystyki pozostają kompletne, bo opierają się na danych dziennych, a nie na historii live.
+
